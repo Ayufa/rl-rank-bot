@@ -11,8 +11,8 @@
 //  4. For each main playlist (2v2 / 3v3 / 1v1) the members with games
 //     this season are ranked by MMR and rendered as a designed image
 //     board (board.go) showing only position, name, rank and rating.
-//     The board messages are EDITED in place on later runs; boards
-//     whose ranking did not change are left untouched.
+//     Every run posts a fresh set of boards and deletes the
+//     previous set (no in-place editing).
 //
 // Usage:
 //
@@ -409,42 +409,37 @@ func deleteMessage(webhook, messageID string) error {
 	return fmt.Errorf("delete message %s: HTTP %d: %s", messageID, resp.StatusCode, string(out))
 }
 
-// syncBoards posts/edits/deletes Discord messages to match boards.
-// Every board is re-edited on every run (the owner's choice), so
-// the time printed on each board is always the last CHECK time,
-// even when no ranking changed.
+// syncBoards replaces the board messages wholesale (the owner's
+// choice): every run posts a FRESH set of boards and then deletes
+// the previous set — no in-place editing. Posting happens first,
+// so the channel never sits empty and a failed post leaves the
+// previous boards untouched.
 func syncBoards(webhook string, st *boardState, boards []imgBoard) error {
-	written := 0
-	for i, b := range boards {
-		if i < len(st.BoardIDs) {
-			id, err := sendBoardImage(webhook, st.BoardIDs[i], b)
-			if err != nil {
-				return err
-			}
-			st.BoardIDs[i] = id
-			written++
-			continue
-		}
+	newIDs := make([]string, 0, len(boards))
+	for _, b := range boards {
 		id, err := sendBoardImage(webhook, "", b)
 		if err != nil {
 			return err
 		}
-		st.BoardIDs = append(st.BoardIDs, id)
-		written++
+		newIDs = append(newIDs, id)
 	}
-	// Shrink: remove surplus boards from earlier, larger rankings.
-	for len(st.BoardIDs) > len(boards) {
-		last := st.BoardIDs[len(st.BoardIDs)-1]
-		if err := deleteMessage(webhook, last); err != nil {
-			return err
+	deleted := 0
+	for _, id := range st.BoardIDs {
+		if id == "" {
+			continue
 		}
-		st.BoardIDs = st.BoardIDs[:len(st.BoardIDs)-1]
+		if err := deleteMessage(webhook, id); err != nil {
+			fmt.Printf("WARN: could not delete previous board %s: %v\n", id, err)
+		} else {
+			deleted++
+		}
 	}
+	st.BoardIDs = newIDs
 	st.BoardHashes = make([]string, len(boards))
 	for i, b := range boards {
 		st.BoardHashes[i] = b.Hash
 	}
-	fmt.Printf("Boards synced: %d message(s), %d written.\n", len(boards), written)
+	fmt.Printf("Boards replaced: %d posted, %d previous deleted.\n", len(newIDs), deleted)
 	// One-time cleanup of any pre-image (v1/v2 text) board.
 	if st.LegacyMessageID != "" {
 		if err := deleteMessage(webhook, st.LegacyMessageID); err != nil {
@@ -461,8 +456,8 @@ func syncBoards(webhook string, st *boardState, boards []imgBoard) error {
 
 // buildImageBoards renders every mode's ranking, splitting a mode
 // into several boards when it has more than rowsPerBoard members.
-// The ordering is deterministic (2v2, 3v3, 1v1, then part 2, ...)
-// so positional state (message IDs / hashes) lines up across runs.
+// The ordering follows mainModes (3v3, 2v2, 1v1, then part 2, ...)
+// so the fresh posts land in the channel in display order.
 func buildImageBoards(perMode map[int][]boardRow, updated time.Time) ([]imgBoard, error) {
 	var boards []imgBoard
 	for _, mode := range mainModes {
@@ -730,21 +725,10 @@ func cmdRun(post, reset bool) error {
 		if webhook == "" {
 			return fmt.Errorf("DISCORD_WEBHOOK_URL is not set")
 		}
-		if reset && len(st.BoardIDs) > 0 {
-			// One-time reorder/repair: Discord message order in a
-			// channel follows post time and cannot be changed by
-			// editing, so the old boards are deleted and reposted
-			// in the current mode order. Later runs edit in place.
-			n := 0
-			for _, id := range st.BoardIDs {
-				if err := deleteMessage(webhook, id); err != nil {
-					fmt.Printf("WARN: reset delete %s: %v\n", id, err)
-				} else {
-					n++
-				}
-			}
-			fmt.Printf("Reset: deleted %d old board(s); reposting fresh.\n", n)
-			st.BoardIDs, st.BoardHashes = nil, nil
+		if reset {
+			// Kept for compatibility: every run already replaces
+			// the boards wholesale, so a reset needs nothing extra.
+			fmt.Println("Reset requested: boards are replaced every run anyway.")
 		}
 		if err := syncBoards(webhook, &st, boards); err != nil {
 			return err

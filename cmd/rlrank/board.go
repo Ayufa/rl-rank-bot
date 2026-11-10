@@ -151,8 +151,11 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 	dc.DrawRectangle(0, 0, boardW, float64(h))
 	dc.Fill()
 
-	// Header: gold bar + mode title + small brand.
-	setColor(dc, 0xE8B93C)
+	// Header: gradient gold bar + mode title + small brand.
+	bar := gg.NewLinearGradient(0, 46, 0, 46+72)
+	bar.AddColorStop(0, colorFromHex(0xF2C14E))
+	bar.AddColorStop(1, colorFromHex(0xC9932B))
+	dc.SetFillStyle(bar)
 	dc.DrawRectangle(boardPad, 46, 10, 72)
 	dc.Fill()
 	if err := setFont(dc, "michroma", 56); err != nil {
@@ -160,11 +163,11 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 	}
 	setColor(dc, 0xF4F6FA)
 	dc.DrawStringAnchored(mode+" RANKING", boardPad+38, 84, 0, 0.5)
-	if err := setFont(dc, "regular", 23); err != nil {
+	if err := setFont(dc, "michroma", 20); err != nil {
 		return nil, err
 	}
-	setColor(dc, 0x62708C)
-	dc.DrawStringAnchored("R O C K E T   L E A G U E", boardW-boardPad, 84, 1, 0.5)
+	setColor(dc, 0x7787A3)
+	dc.DrawStringAnchored("ROCKET LEAGUE", boardW-boardPad, 84, 1, 0.5)
 	// Gold rule under the header.
 	rule := gg.NewLinearGradient(boardPad, 0, boardW-boardPad, 0)
 	rule.AddColorStop(0, colorFromHex(0xE8B93C))
@@ -177,7 +180,7 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 		if err := setFont(dc, "regular", 32); err != nil {
 			return nil, err
 		}
-		setColor(dc, 0x8E9BB5)
+		setColor(dc, 0xA9BAD2)
 		dc.DrawStringAnchored("今季プレイヤーなし", boardW/2, headerH+(rowsPerBoard*rowH)/2, 0.5, 0.5)
 	} else {
 		for i, row := range rows {
@@ -190,6 +193,13 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			}
 			// Position.
 			rank := startRank + i
+			// Podium accent: a slim bar in the position colour
+			// along the left edge for the top 3.
+			if c, ok := posColors[rank]; ok {
+				setColor(dc, c)
+				dc.DrawRectangle(0, y0, 5, rowH)
+				dc.Fill()
+			}
 			if err := setFont(dc, "bold", 38); err != nil {
 				return nil, err
 			}
@@ -238,6 +248,15 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			if icon := rankIcon(row.Tier); icon != nil {
 				mmrW, _ := dc.MeasureString(mmrText)
 				iconRight := boardW - boardPad - mmrW - 16
+				// Subtle disc behind the icon, like a medal.
+				cx := iconRight - rankIconSize/2
+				dc.SetRGBA(1, 1, 1, 0.05)
+				dc.DrawCircle(cx, cy, rankIconSize/2+8)
+				dc.Fill()
+				dc.SetRGBA(1, 1, 1, 0.10)
+				dc.SetLineWidth(1)
+				dc.DrawCircle(cx, cy, rankIconSize/2+8)
+				dc.Stroke()
 				dc.DrawImageAnchored(icon, int(iconRight), int(cy), 1, 0.5)
 			}
 			// Divider.
@@ -247,20 +266,32 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 		}
 	}
 
-	// Footer. The update time is the part people actually read,
-	// so it is drawn bold, larger and bright; the brand label
-	// stays quieter.
+	// Footer: a mirrored gold hairline echoes the header rule,
+	// and the texts are set in Michroma at regular weight — the
+	// font's wide letterforms do the styling, no bold needed.
+	frule := gg.NewLinearGradient(boardPad, 0, boardW-boardPad, 0)
+	frule.AddColorStop(0, colorFromHexA(0xE8B93C, 0))
+	frule.AddColorStop(1, colorFromHex(0xE8B93C))
+	dc.SetFillStyle(frule)
+	dc.DrawRectangle(boardPad, float64(h)-footerH, boardW-2*boardPad, 2)
+	dc.Fill()
 	jst := time.FixedZone("JST", 9*60*60)
-	if err := setFont(dc, "regular", 24); err != nil {
+	if err := setFont(dc, "michroma", 19); err != nil {
 		return nil, err
 	}
-	setColor(dc, 0x8494B3)
-	dc.DrawStringAnchored("RL RANK LIVE", boardPad, float64(h)-22, 0, 0.5)
-	if err := setFont(dc, "bold", 32); err != nil {
+	setColor(dc, 0x7787A3)
+	dc.DrawStringAnchored("RL RANK LIVE", boardPad, float64(h)-26, 0, 0.5)
+	if err := setFont(dc, "michroma", 24); err != nil {
 		return nil, err
 	}
-	setColor(dc, 0xE6EDF8)
-	dc.DrawStringAnchored(updated.In(jst).Format("2006/01/02 15:04")+" 更新", boardW-boardPad, float64(h)-22, 1, 0.5)
+	setColor(dc, 0xCBD6E8)
+	dc.DrawStringAnchored(updated.In(jst).Format("2006.01.02 15:04")+" JST", boardW-boardPad, float64(h)-26, 1, 0.5)
+
+	// Framing stroke around the whole card.
+	dc.SetRGBA(1, 1, 1, 0.07)
+	dc.SetLineWidth(2)
+	dc.DrawRectangle(1, 1, boardW-2, float64(h)-2)
+	dc.Stroke()
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dc.Image(), &jpeg.Options{Quality: 90}); err != nil {
