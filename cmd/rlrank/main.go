@@ -462,6 +462,11 @@ func cmdRun(post bool) error {
 		if !ok || (s.MatchesPlayed == 0 && s.Tier == 0) {
 			continue
 		}
+		// Extra modes keep last season's tier with 0 matches played;
+		// showing those would present a stale rank as current.
+		if !pi.main && s.MatchesPlayed == 0 {
+			continue
+		}
 		mmr := displayMMR(s)
 		if pi.main && s.Tier > bestTier {
 			bestTier = s.Tier
