@@ -248,15 +248,6 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			if icon := rankIcon(row.Tier); icon != nil {
 				mmrW, _ := dc.MeasureString(mmrText)
 				iconRight := boardW - boardPad - mmrW - 16
-				// Subtle disc behind the icon, like a medal.
-				cx := iconRight - rankIconSize/2
-				dc.SetRGBA(1, 1, 1, 0.05)
-				dc.DrawCircle(cx, cy, rankIconSize/2+8)
-				dc.Fill()
-				dc.SetRGBA(1, 1, 1, 0.10)
-				dc.SetLineWidth(1)
-				dc.DrawCircle(cx, cy, rankIconSize/2+8)
-				dc.Stroke()
 				dc.DrawImageAnchored(icon, int(iconRight), int(cy), 1, 0.5)
 			}
 			// Divider.
