@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       post:
-        description: "Post/edit the Discord board (off = verification only, prints skills to the log)"
+        description: "Post/edit the Discord board (off = verification only, prints the ranking to the log)"
         type: boolean
         default: false
 
