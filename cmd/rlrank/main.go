@@ -557,7 +557,7 @@ func cmdAuthCode(args []string) error {
 	if err := writeRefreshToken(auth.RefreshToken); err != nil {
 		return err
 	}
-	fmt.Printf("Dedicated rank-bot login saved (account: %s)\n", auth.DisplayName)
+	fmt.Println("Dedicated rank-bot login saved")
 	return nil
 }
 
@@ -584,7 +584,9 @@ func cmdRun(post, reset bool) error {
 		return err
 	}
 	defer rpc.Close()
-	fmt.Printf("Logged in as %s\n", auth.DisplayName)
+	// NOTE: never print the querier's display name or any account
+	// ID — Actions logs of this repository are public.
+	fmt.Println("Logged in (dedicated rank-bot account)")
 	fmt.Printf("Targets: %d member(s)\n", len(targets))
 
 	st := loadState()
