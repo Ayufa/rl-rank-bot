@@ -32,3 +32,15 @@ Discord の1投稿を編集し続けて、特定プレイヤーの Rocket League
 
 GitHub Actions の `RL Rank Live Board` ワークフローを手動 dispatch。
 `post` オフ = 検証のみ（スキルをログに出力）、オン = ボード投稿／編集。
+
+## トークン復旧手順
+
+refresh token の所有者は Actions cache（`state/`）。cache は7日使われないと
+消えるため、長期間実行しないとチェーンが切れることがある。その場合は:
+
+1. `rlrank auth-url` → ログイン → `rlrank auth-code <code>` で再ログイン
+2. Secret `RL_RANK_REFRESH_TOKEN` を新しい token.txt の中身で更新
+3. Actions cache を削除してから dispatch（空なら Secret から再シードされる）
+
+ローカルの token.txt はシード用の一時コピーで、Actions が回り始めたら無効。
+ローカルで `run` してはいけない（チェーンを壊す）。
