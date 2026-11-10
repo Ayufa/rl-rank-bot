@@ -459,45 +459,27 @@ func syncBoards(webhook string, st *boardState, boards []imgBoard) error {
 
 // -------------------------------------------------------------- ranking
 
-// buildImageBoards renders every mode's ranking, splitting a mode
-// into several boards when it has more than rowsPerBoard members.
-// The ordering follows mainModes (3v3, 2v2, 1v1, then part 2, ...)
-// so the fresh posts land in the channel in display order.
+// buildImageBoards renders every mode's ranking as ONE board
+// per mode (the owner's choice): a board grows taller as its
+// roster grows instead of splitting into several images, and
+// row size / fonts never change, so readability is constant.
+// Ordering follows mainModes (3v3, 2v2, 1v1).
 func buildImageBoards(perMode map[int][]boardRow, updated time.Time) ([]imgBoard, error) {
 	var boards []imgBoard
 	for _, mode := range mainModes {
 		rows := perMode[mode.id]
-		chunks := [][]boardRow{rows}
-		if len(rows) > rowsPerBoard {
-			chunks = nil
-			for i := 0; i < len(rows); i += rowsPerBoard {
-				end := i + rowsPerBoard
-				if end > len(rows) {
-					end = len(rows)
-				}
-				chunks = append(chunks, rows[i:end])
-			}
+		filename := fmt.Sprintf("ranking-%s.jpg", strings.ToLower(mode.label))
+		img, err := renderBoard(mode.label, rows, 1, updated)
+		if err != nil {
+			return nil, err
 		}
-		for ci, chunk := range chunks {
-			label := mode.label
-			filename := fmt.Sprintf("ranking-%s.jpg", strings.ToLower(mode.label))
-			if len(chunks) > 1 {
-				label = fmt.Sprintf("%s (%d/%d)", mode.label, ci+1, len(chunks))
-				filename = fmt.Sprintf("ranking-%s-%d.jpg", strings.ToLower(mode.label), ci+1)
-			}
-			img, err := renderBoard(label, chunk, ci*rowsPerBoard+1, updated)
-			if err != nil {
-				return nil, err
-			}
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "%s\n", mode.label)
-			base := ci * rowsPerBoard
-			for ri, r := range chunk {
-				fmt.Fprintf(&sb, "%d|%s|%d|%d|%d\n", base+ri+1, r.Name, r.Tier, r.Division, r.MMR)
-			}
-			sum := sha256.Sum256([]byte(sb.String()))
-			boards = append(boards, imgBoard{Filename: filename, Bytes: img, Hash: hex.EncodeToString(sum[:])})
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "%s\n", mode.label)
+		for ri, r := range rows {
+			fmt.Fprintf(&sb, "%d|%s|%d|%d|%d\n", ri+1, r.Name, r.Tier, r.Division, r.MMR)
 		}
+		sum := sha256.Sum256([]byte(sb.String()))
+		boards = append(boards, imgBoard{Filename: filename, Bytes: img, Hash: hex.EncodeToString(sum[:])})
 	}
 	return boards, nil
 }
