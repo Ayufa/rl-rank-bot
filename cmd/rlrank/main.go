@@ -639,12 +639,31 @@ func cmdRun(post, reset bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Batched skill fetch for everyone at once.
+	nameOf := map[string]string{}
+	for _, m := range members {
+		nameOf[string(rlapi.NewPlayerID(rlapi.PlatformEpic, m.accountID))] = m.targetName
+	}
+
+	// Batched skill fetch for everyone at once. A single account
+	// unknown to PsyNet (an Epic account that never played RL) can
+	// reject the whole batch, so on failure fall back to per-player
+	// fetches: one bad member must not take the whole board down.
 	skillsByPlayer := map[string][]rlapi.Skill{}
 	for _, chunk := range chunkIDs(ids, 20) {
 		players, err := rpc.GetPlayersSkills(ctx, chunk)
 		if err != nil {
-			return fmt.Errorf("GetPlayersSkills: %w", err)
+			fmt.Printf("WARN: GetPlayersSkills batch failed (%v); retrying per player\n", err)
+			for _, id := range chunk {
+				one, err := rpc.GetPlayersSkills(ctx, []rlapi.PlayerID{id})
+				if err != nil {
+					fmt.Printf("WARN: skills for %q failed, skipped this run: %v\n", nameOf[string(id)], err)
+					continue
+				}
+				for _, p := range one {
+					skillsByPlayer[string(p.PlayerID)] = p.Skills
+				}
+			}
+			continue
 		}
 		for _, p := range players {
 			skillsByPlayer[string(p.PlayerID)] = p.Skills
@@ -655,8 +674,19 @@ func cmdRun(post, reset bool) error {
 	for _, chunk := range chunkIDs(ids, 20) {
 		profiles, err := rpc.GetProfiles(ctx, chunk)
 		if err != nil {
-			fmt.Printf("WARN: GetProfiles failed (names may be stale): %v\n", err)
-			break
+			fmt.Printf("WARN: GetProfiles batch failed (%v); retrying per player\n", err)
+			for _, id := range chunk {
+				one, err := rpc.GetProfiles(ctx, []rlapi.PlayerID{id})
+				if err != nil {
+					continue
+				}
+				for _, p := range one {
+					if p.PlayerName != "" {
+						nameByPlayer[p.PlayerID] = p.PlayerName
+					}
+				}
+			}
+			continue
 		}
 		for _, p := range profiles {
 			if p.PlayerName != "" {
