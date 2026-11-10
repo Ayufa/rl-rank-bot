@@ -247,14 +247,20 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 		}
 	}
 
-	// Footer.
-	if err := setFont(dc, "regular", 22); err != nil {
+	// Footer. The update time is the part people actually read,
+	// so it is drawn bold, larger and bright; the brand label
+	// stays quieter.
+	jst := time.FixedZone("JST", 9*60*60)
+	if err := setFont(dc, "regular", 24); err != nil {
 		return nil, err
 	}
-	setColor(dc, 0x62708C)
-	jst := time.FixedZone("JST", 9*60*60)
-	dc.DrawStringAnchored("RL RANK LIVE", boardPad, float64(h)-20, 0, 0.5)
-	dc.DrawStringAnchored(updated.In(jst).Format("2006/01/02 15:04")+" 更新", boardW-boardPad, float64(h)-20, 1, 0.5)
+	setColor(dc, 0x8494B3)
+	dc.DrawStringAnchored("RL RANK LIVE", boardPad, float64(h)-22, 0, 0.5)
+	if err := setFont(dc, "bold", 32); err != nil {
+		return nil, err
+	}
+	setColor(dc, 0xE6EDF8)
+	dc.DrawStringAnchored(updated.In(jst).Format("2006/01/02 15:04")+" 更新", boardW-boardPad, float64(h)-22, 1, 0.5)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dc.Image(), &jpeg.Options{Quality: 90}); err != nil {
