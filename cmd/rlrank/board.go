@@ -108,11 +108,6 @@ type boardRow struct {
 	Division int
 	MMR      int
 	Matches  int // sort tiebreak only, not displayed
-	// Delta is the rating change since the start of the week
-	// (Monday 00:00 JST reset); DeltaKnown is false only while
-	// the member has no recorded sample this week.
-	Delta      int
-	DeltaKnown bool
 }
 
 // imgBoard is one rendered board message.
@@ -200,20 +195,15 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 		setColor(dc, 0xA9BAD2)
 		dc.DrawStringAnchored("今季プレイヤーなし", boardW/2, headerH+(float64(slots)*rowH)/2, 0.5, 0.5)
 	} else {
-		// Fixed right-zone slots: [rank icon][MMR][weekly delta],
-		// each anchored at a constant x measured off worst-case
-		// strings, so the rating column lines up vertically no
-		// matter what values a row carries.
+		// Fixed right-zone slots: [rank icon][MMR], each
+		// anchored at a constant x measured off a worst-case
+		// string, so the rating column lines up vertically no
+		// matter how many digits a row carries.
 		if err := setFont(dc, "bold", 45); err != nil {
 			return nil, err
 		}
 		mmrSlotW, _ := dc.MeasureString("9999")
-		if err := setFont(dc, "bold", 30); err != nil {
-			return nil, err
-		}
-		deltaSlotW, _ := dc.MeasureString("▼-999")
-		deltaRightX := boardW - boardPad
-		mmrRightX := deltaRightX - deltaSlotW - 16
+		mmrRightX := boardW - boardPad
 		iconRightX := mmrRightX - mmrSlotW - 16
 		textLimitX := iconRightX - 54 - 26 // rank icons are 54px wide
 
@@ -250,7 +240,7 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			}
 			labelFull := tierLabel(row.Tier, row.Division)
 			labelW, _ := dc.MeasureString(labelFull)
-			// Right zone holds [rank icon][MMR][delta] in fixed
+			// Right zone holds [rank icon][MMR] in fixed
 			// slots; text stops before it.
 			mmrZoneX := textLimitX
 			nameX := boardPad + 88
@@ -273,19 +263,8 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			setColor(dc, 0xB7C2D6)
 			label := truncateToWidth(dc, labelFull, mmrZoneX-(nameX+nameW+26))
 			dc.DrawStringAnchored(label, nameX+nameW+26, cy, 0, 0.5)
-			// Rating, rank icon and weekly delta, all in fixed
-			// slots: identical x positions on every row.
-			deltaText := ""
-			if row.DeltaKnown {
-				switch {
-				case row.Delta > 0:
-					deltaText = fmt.Sprintf("▲+%d", row.Delta)
-				case row.Delta < 0:
-					deltaText = fmt.Sprintf("▼%d", row.Delta)
-				default:
-					deltaText = "±0"
-				}
-			}
+			// Rating and rank icon in FIXED slots: identical x
+			// positions on every row.
 			if err := setFont(dc, "bold", 45); err != nil {
 				return nil, err
 			}
@@ -293,20 +272,6 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			dc.DrawStringAnchored(fmt.Sprintf("%d", row.MMR), mmrRightX, cy, 1, 0.5)
 			if icon := rankIcon(row.Tier); icon != nil {
 				dc.DrawImageAnchored(icon, int(iconRightX), int(cy), 1, 0.5)
-			}
-			if deltaText != "" {
-				if err := setFont(dc, "bold", 30); err != nil {
-					return nil, err
-				}
-				switch {
-				case row.Delta > 0:
-					setColor(dc, 0x4ADE80)
-				case row.Delta < 0:
-					setColor(dc, 0xF87171)
-				default:
-					setColor(dc, 0x8E9BB5)
-				}
-				dc.DrawStringAnchored(deltaText, deltaRightX, cy, 1, 0.5)
 			}
 			// Divider.
 			dc.SetRGBA(1, 1, 1, 0.05)

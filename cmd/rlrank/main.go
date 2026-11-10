@@ -10,11 +10,10 @@
 //     batched calls: per-playlist Tier / Division / MMR / Matches.
 //  4. For each main playlist (2v2 / 3v3 / 1v1) the members with games
 //     this season are ranked by MMR and rendered as a designed image
-//     board (board.go) showing position, name, abbreviated rank,
-//     rating and the rating's change since Monday (weekly
-//     reset). The board messages are EDITED in place on every
-//     run, so the time printed on each board is always the
-//     last check time.
+//     board (board.go) showing position, name, abbreviated rank
+//     and rating. The board messages are EDITED in place on
+//     every run, so the time printed on each board is always
+//     the last check time.
 //
 // Usage:
 //
@@ -147,8 +146,9 @@ type boardState struct {
 	Resolved    map[string]string `json:"resolved,omitempty"` // target name -> account ID
 	UpdatedAt   string            `json:"updated_at,omitempty"`
 	// History holds rating samples per "<accountID>|<playlist>"
-	// for the current week (thinned to one per ~30 minutes); the
-	// week's earliest sample is the delta baseline.
+	// for the current week (thinned to one per ~30 minutes).
+	// Not displayed; kept so a rating-delta display can be
+	// re-enabled without a cold start.
 	History map[string][]ratePoint `json:"history,omitempty"`
 
 	// Legacy v1 field (single-player text board), deleted once.
@@ -159,8 +159,8 @@ func historyKey(accountID string, playlist int) string {
 	return accountID + "|" + strconv.Itoa(playlist)
 }
 
-// weekStart returns the most recent Monday 00:00 JST — the
-// anchor of the boards' weekly rating delta.
+// weekStart returns the most recent Monday 00:00 JST; rating
+// samples older than the current week are pruned.
 func weekStart(now time.Time) time.Time {
 	jst := time.FixedZone("JST", 9*60*60)
 	t := now.In(jst)
@@ -169,28 +169,8 @@ func weekStart(now time.Time) time.Time {
 	return midnight.AddDate(0, 0, -offset)
 }
 
-// deltaWeek returns the rating change since the start of the
-// current week: the baseline is the EARLIEST sample recorded
-// in the current week, so the delta is live from the week's
-// first check (starting at ±0), accumulates day by day, and
-// resets every Monday 00:00 JST when a new week begins. ok is
-// false only when the member has no sample at all this week.
-func (st *boardState) deltaWeek(key string, now time.Time, current int) (delta int, ok bool) {
-	start := weekStart(now).Unix()
-	base := int64(-1)
-	for _, p := range st.History[key] {
-		if p.T >= start && (base < 0 || p.T < base) {
-			base = p.T
-			delta = current - p.M
-			ok = true
-		}
-	}
-	return delta, ok
-}
-
 // pruneHistory drops samples from before the current week
-// (they can no longer serve as a baseline) and the history of
-// accounts that are no longer tracked.
+// and the history of accounts that are no longer tracked.
 func (st *boardState) pruneHistory(now time.Time, keepIDs map[string]bool) {
 	cutoff := weekStart(now).Unix()
 	for key, pts := range st.History {
@@ -550,7 +530,7 @@ func buildImageBoards(perMode map[int][]boardRow, updated time.Time) ([]imgBoard
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "%s\n", mode.label)
 		for ri, r := range rows {
-			fmt.Fprintf(&sb, "%d|%s|%d|%d|%d|%d|%t\n", ri+1, r.Name, r.Tier, r.Division, r.MMR, r.Delta, r.DeltaKnown)
+			fmt.Fprintf(&sb, "%d|%s|%d|%d|%d\n", ri+1, r.Name, r.Tier, r.Division, r.MMR)
 		}
 		sum := sha256.Sum256([]byte(sb.String()))
 		boards = append(boards, imgBoard{Filename: filename, Bytes: img, Hash: hex.EncodeToString(sum[:])})
@@ -768,17 +748,18 @@ func cmdRun(post, reset bool) error {
 				continue // not active in this mode this season
 			}
 			mmr := displayMMR(s)
-			// Record a thinned sample (one per ~30 min is
-			// plenty), then compare against the week's start.
+			// Record a thinned rating sample (one per ~30
+			// min). Nothing displays it today — a weekly delta
+			// was tried and removed at the owner's request —
+			// but keeping the current week's samples means a
+			// delta display can return without a cold start.
 			key := historyKey(m.accountID, mode.id)
 			if pts := st.History[key]; len(pts) == 0 || nowHist.Sub(time.Unix(pts[len(pts)-1].T, 0)) >= 30*time.Minute {
 				st.History[key] = append(st.History[key], ratePoint{T: nowHist.Unix(), M: mmr})
 			}
-			delta, known := st.deltaWeek(key, nowHist, mmr)
 			perMode[mode.id] = append(perMode[mode.id], boardRow{
 				Name: name, Tier: s.Tier, Division: s.Division,
 				MMR: mmr, Matches: s.MatchesPlayed,
-				Delta: delta, DeltaKnown: known,
 			})
 		}
 	}
@@ -828,11 +809,7 @@ func cmdRun(post, reset bool) error {
 			rows := perMode[mode.id]
 			fmt.Printf("[%s] %d player(s)\n", mode.label, len(rows))
 			for i, r := range rows {
-				line := fmt.Sprintf("  #%d %s — %s — %d", i+1, r.Name, tierLabel(r.Tier, r.Division), r.MMR)
-				if r.DeltaKnown {
-					line += fmt.Sprintf(" (%+d this week)", r.Delta)
-				}
-				fmt.Println(line)
+				fmt.Printf("  #%d %s — %s — %d\n", i+1, r.Name, tierLabel(r.Tier, r.Division), r.MMR)
 			}
 		}
 	}
@@ -846,19 +823,19 @@ func cmdRun(post, reset bool) error {
 func cmdDemo() error {
 	perMode := map[int][]boardRow{
 		11: {
-			{Name: "RocketTaro", Tier: 22, Division: 0, MMR: 1902, Matches: 210, Delta: 24, DeltaKnown: true},
-			{Name: "Αyufa", Tier: 19, Division: 2, MMR: 1524, Matches: 89, Delta: 57, DeltaKnown: true},
-			{Name: "さくら", Tier: 17, Division: 0, MMR: 1411, Matches: 64, Delta: 0, DeltaKnown: true},
-			{Name: "zeekend_14", Tier: 15, Division: 1, MMR: 1003, Matches: 41, Delta: -18, DeltaKnown: true},
-			{Name: "xX_ShadowSniper_99_Xx", Tier: 10, Division: 3, MMR: 768, Matches: 33, Delta: 112, DeltaKnown: true},
+			{Name: "RocketTaro", Tier: 22, Division: 0, MMR: 1902, Matches: 210},
+			{Name: "Αyufa", Tier: 19, Division: 2, MMR: 1524, Matches: 89},
+			{Name: "さくら", Tier: 17, Division: 0, MMR: 1411, Matches: 64},
+			{Name: "zeekend_14", Tier: 15, Division: 1, MMR: 1003, Matches: 41},
+			{Name: "xX_ShadowSniper_99_Xx", Tier: 10, Division: 3, MMR: 768, Matches: 33},
 			{Name: "mochi", Tier: 7, Division: 1, MMR: 512, Matches: 12},
-			{Name: "PlacementPro", Tier: 0, Division: 0, MMR: 498, Matches: 6, Delta: -25, DeltaKnown: true},
-			{Name: "B2", Tier: 2, Division: 0, MMR: 214, Matches: 18, Delta: 4, DeltaKnown: true},
+			{Name: "PlacementPro", Tier: 0, Division: 0, MMR: 498, Matches: 6},
+			{Name: "B2", Tier: 2, Division: 0, MMR: 214, Matches: 18},
 		},
 		13: {
-			{Name: "Αyufa", Tier: 18, Division: 3, MMR: 1403, Matches: 23, Delta: 39, DeltaKnown: true},
-			{Name: "さくら", Tier: 16, Division: 2, MMR: 1250, Matches: 51, Delta: -52, DeltaKnown: true},
-			{Name: "zeekend_14", Tier: 13, Division: 0, MMR: 940, Matches: 29, Delta: 15, DeltaKnown: true},
+			{Name: "Αyufa", Tier: 18, Division: 3, MMR: 1403, Matches: 23},
+			{Name: "さくら", Tier: 16, Division: 2, MMR: 1250, Matches: 51},
+			{Name: "zeekend_14", Tier: 13, Division: 0, MMR: 940, Matches: 29},
 		},
 		10: {},
 	}
