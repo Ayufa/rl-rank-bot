@@ -11,9 +11,10 @@
 //  4. For each main playlist (2v2 / 3v3 / 1v1) the members with games
 //     this season are ranked by MMR and rendered as a designed image
 //     board (board.go) showing position, name, abbreviated rank,
-//     rating and the rating's 7-day change. The board messages
-//     are EDITED in place on every run, so the time printed on
-//     each board is always the last check time.
+//     rating and the rating's change since Monday (weekly
+//     reset). The board messages are EDITED in place on every
+//     run, so the time printed on each board is always the
+//     last check time.
 //
 // Usage:
 //
@@ -145,9 +146,9 @@ type boardState struct {
 	BoardHashes []string          `json:"board_hashes,omitempty"`
 	Resolved    map[string]string `json:"resolved,omitempty"` // target name -> account ID
 	UpdatedAt   string            `json:"updated_at,omitempty"`
-	// History holds rating samples per "<accountID>|<playlist>",
-	// thinned to one per ~30 minutes and kept ~8 days; it backs
-	// the boards' rating delta.
+	// History holds rating samples per "<accountID>|<playlist>"
+	// for the current week (thinned to one per ~30 minutes); the
+	// week's earliest sample is the delta baseline.
 	History map[string][]ratePoint `json:"history,omitempty"`
 
 	// Legacy v1 field (single-player text board), deleted once.
@@ -158,44 +159,40 @@ func historyKey(accountID string, playlist int) string {
 	return accountID + "|" + strconv.Itoa(playlist)
 }
 
-// deltaWindow is how far back the boards' rating delta looks.
-// The comparison baseline is the sample closest to one window
-// ago. History is kept much longer than the window (see
-// pruneHistory), so the window can be widened later without
-// losing the data it needs.
-const deltaWindow = 7 * 24 * time.Hour
-
-// deltaSince returns the rating change versus the sample
-// closest to deltaWindow ago. The baseline sample must be at
-// least ~1h younger than a full window, so a delta appears
-// only once enough history has accumulated; until then ok is
-// false and the board shows nothing beside the rating.
-func (st *boardState) deltaSince(key string, now time.Time, current int) (delta int, ok bool) {
-	pts := st.History[key]
-	target := now.Add(-deltaWindow).Unix()
-	oldest := now.Add(-deltaWindow + time.Hour).Unix()
-	best := int64(-1)
-	bestDist := int64(1 << 62)
-	for _, p := range pts {
-		if p.T > oldest {
-			continue // too fresh to be a baseline
-		}
-		d := p.T - target
-		if d < 0 {
-			d = -d
-		}
-		if d < bestDist {
-			bestDist, best = d, p.T
-			delta = current - p.M
-		}
-	}
-	return delta, best >= 0
+// weekStart returns the most recent Monday 00:00 JST — the
+// anchor of the boards' weekly rating delta.
+func weekStart(now time.Time) time.Time {
+	jst := time.FixedZone("JST", 9*60*60)
+	t := now.In(jst)
+	midnight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, jst)
+	offset := (int(t.Weekday()) + 6) % 7 // days since Monday
+	return midnight.AddDate(0, 0, -offset)
 }
 
-// pruneHistory drops samples older than ~8 days and the
-// history of accounts that are no longer tracked.
+// deltaWeek returns the rating change since the start of the
+// current week: the baseline is the EARLIEST sample recorded
+// in the current week, so the delta is live from the week's
+// first check (starting at ±0), accumulates day by day, and
+// resets every Monday 00:00 JST when a new week begins. ok is
+// false only when the member has no sample at all this week.
+func (st *boardState) deltaWeek(key string, now time.Time, current int) (delta int, ok bool) {
+	start := weekStart(now).Unix()
+	base := int64(-1)
+	for _, p := range st.History[key] {
+		if p.T >= start && (base < 0 || p.T < base) {
+			base = p.T
+			delta = current - p.M
+			ok = true
+		}
+	}
+	return delta, ok
+}
+
+// pruneHistory drops samples from before the current week
+// (they can no longer serve as a baseline) and the history of
+// accounts that are no longer tracked.
 func (st *boardState) pruneHistory(now time.Time, keepIDs map[string]bool) {
-	cutoff := now.Add(-8 * 24 * time.Hour).Unix()
+	cutoff := weekStart(now).Unix()
 	for key, pts := range st.History {
 		id, _, _ := strings.Cut(key, "|")
 		if !keepIDs[id] {
@@ -772,12 +769,12 @@ func cmdRun(post, reset bool) error {
 			}
 			mmr := displayMMR(s)
 			// Record a thinned sample (one per ~30 min is
-			// plenty), then compare against one window ago.
+			// plenty), then compare against the week's start.
 			key := historyKey(m.accountID, mode.id)
 			if pts := st.History[key]; len(pts) == 0 || nowHist.Sub(time.Unix(pts[len(pts)-1].T, 0)) >= 30*time.Minute {
 				st.History[key] = append(st.History[key], ratePoint{T: nowHist.Unix(), M: mmr})
 			}
-			delta, known := st.deltaSince(key, nowHist, mmr)
+			delta, known := st.deltaWeek(key, nowHist, mmr)
 			perMode[mode.id] = append(perMode[mode.id], boardRow{
 				Name: name, Tier: s.Tier, Division: s.Division,
 				MMR: mmr, Matches: s.MatchesPlayed,
@@ -833,7 +830,7 @@ func cmdRun(post, reset bool) error {
 			for i, r := range rows {
 				line := fmt.Sprintf("  #%d %s — %s — %d", i+1, r.Name, tierLabel(r.Tier, r.Division), r.MMR)
 				if r.DeltaKnown {
-					line += fmt.Sprintf(" (%+d over %s)", r.Delta, deltaWindow)
+					line += fmt.Sprintf(" (%+d this week)", r.Delta)
 				}
 				fmt.Println(line)
 			}

@@ -108,8 +108,9 @@ type boardRow struct {
 	Division int
 	MMR      int
 	Matches  int // sort tiebreak only, not displayed
-	// Delta is the rating change over the past 7 days;
-	// DeltaKnown is false until enough history exists.
+	// Delta is the rating change since the start of the week
+	// (Monday 00:00 JST reset); DeltaKnown is false only while
+	// the member has no recorded sample this week.
 	Delta      int
 	DeltaKnown bool
 }
@@ -199,7 +200,7 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 		setColor(dc, 0xA9BAD2)
 		dc.DrawStringAnchored("今季プレイヤーなし", boardW/2, headerH+(float64(slots)*rowH)/2, 0.5, 0.5)
 	} else {
-		// Fixed right-zone slots: [rank icon][MMR][7-day delta],
+		// Fixed right-zone slots: [rank icon][MMR][weekly delta],
 		// each anchored at a constant x measured off worst-case
 		// strings, so the rating column lines up vertically no
 		// matter what values a row carries.
@@ -272,7 +273,7 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			setColor(dc, 0xB7C2D6)
 			label := truncateToWidth(dc, labelFull, mmrZoneX-(nameX+nameW+26))
 			dc.DrawStringAnchored(label, nameX+nameW+26, cy, 0, 0.5)
-			// Rating, rank icon and 7-day delta, all in fixed
+			// Rating, rank icon and weekly delta, all in fixed
 			// slots: identical x positions on every row.
 			deltaText := ""
 			if row.DeltaKnown {
