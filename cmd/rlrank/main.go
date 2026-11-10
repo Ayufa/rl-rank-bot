@@ -10,9 +10,10 @@
 //     batched calls: per-playlist Tier / Division / MMR / Matches.
 //  4. For each main playlist (2v2 / 3v3 / 1v1) the members with games
 //     this season are ranked by MMR and rendered as a designed image
-//     board (board.go) showing only position, name, rank and rating.
-//     The board messages are EDITED in place on every run, so the
-//     time printed on each board is always the last check time.
+//     board (board.go) showing position, name, abbreviated rank,
+//     rating and the rating's 7-day change. The board messages
+//     are EDITED in place on every run, so the time printed on
+//     each board is always the last check time.
 //
 // Usage:
 //
@@ -46,6 +47,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,14 +58,14 @@ import (
 
 var tierNames = []string{
 	"Unranked",
-	"Bronze I", "Bronze II", "Bronze III",
-	"Silver I", "Silver II", "Silver III",
-	"Gold I", "Gold II", "Gold III",
-	"Platinum I", "Platinum II", "Platinum III",
-	"Diamond I", "Diamond II", "Diamond III",
-	"Champion I", "Champion II", "Champion III",
-	"Grand Champion I", "Grand Champion II", "Grand Champion III",
-	"Supersonic Legend",
+	"B I", "B II", "B III",
+	"S I", "S II", "S III",
+	"G I", "G II", "G III",
+	"P I", "P II", "P III",
+	"D I", "D II", "D III",
+	"C I", "C II", "C III",
+	"GC I", "GC II", "GC III",
+	"SSL",
 }
 
 var divisionRoman = []string{"I", "II", "III", "IV"}
@@ -131,15 +133,87 @@ func displayMMR(s rlapi.Skill) int {
 
 // ---------------------------------------------------------------- state
 
+// ratePoint is one recorded rating sample.
+type ratePoint struct {
+	T int64 `json:"t"` // unix seconds
+	M int   `json:"m"` // displayed MMR at that time
+}
+
 type boardState struct {
 	Version     int               `json:"version,omitempty"`
 	BoardIDs    []string          `json:"board_ids,omitempty"`
 	BoardHashes []string          `json:"board_hashes,omitempty"`
 	Resolved    map[string]string `json:"resolved,omitempty"` // target name -> account ID
 	UpdatedAt   string            `json:"updated_at,omitempty"`
+	// History holds rating samples per "<accountID>|<playlist>",
+	// thinned to one per ~30 minutes and kept ~8 days; it backs
+	// the boards' rating delta.
+	History map[string][]ratePoint `json:"history,omitempty"`
 
 	// Legacy v1 field (single-player text board), deleted once.
 	LegacyMessageID string `json:"message_id,omitempty"`
+}
+
+func historyKey(accountID string, playlist int) string {
+	return accountID + "|" + strconv.Itoa(playlist)
+}
+
+// deltaWindow is how far back the boards' rating delta looks.
+// The comparison baseline is the sample closest to one window
+// ago. History is kept much longer than the window (see
+// pruneHistory), so the window can be widened later without
+// losing the data it needs.
+const deltaWindow = 7 * 24 * time.Hour
+
+// deltaSince returns the rating change versus the sample
+// closest to deltaWindow ago. The baseline sample must be at
+// least ~1h younger than a full window, so a delta appears
+// only once enough history has accumulated; until then ok is
+// false and the board shows nothing beside the rating.
+func (st *boardState) deltaSince(key string, now time.Time, current int) (delta int, ok bool) {
+	pts := st.History[key]
+	target := now.Add(-deltaWindow).Unix()
+	oldest := now.Add(-deltaWindow + time.Hour).Unix()
+	best := int64(-1)
+	bestDist := int64(1 << 62)
+	for _, p := range pts {
+		if p.T > oldest {
+			continue // too fresh to be a baseline
+		}
+		d := p.T - target
+		if d < 0 {
+			d = -d
+		}
+		if d < bestDist {
+			bestDist, best = d, p.T
+			delta = current - p.M
+		}
+	}
+	return delta, best >= 0
+}
+
+// pruneHistory drops samples older than ~8 days and the
+// history of accounts that are no longer tracked.
+func (st *boardState) pruneHistory(now time.Time, keepIDs map[string]bool) {
+	cutoff := now.Add(-8 * 24 * time.Hour).Unix()
+	for key, pts := range st.History {
+		id, _, _ := strings.Cut(key, "|")
+		if !keepIDs[id] {
+			delete(st.History, key)
+			continue
+		}
+		out := pts[:0]
+		for _, p := range pts {
+			if p.T >= cutoff {
+				out = append(out, p)
+			}
+		}
+		if len(out) == 0 {
+			delete(st.History, key)
+		} else {
+			st.History[key] = out
+		}
+	}
 }
 
 func stateFilePath() string {
@@ -157,6 +231,9 @@ func loadState() boardState {
 	}
 	if st.Resolved == nil {
 		st.Resolved = map[string]string{}
+	}
+	if st.History == nil {
+		st.History = map[string][]ratePoint{}
 	}
 	return st
 }
@@ -476,7 +553,7 @@ func buildImageBoards(perMode map[int][]boardRow, updated time.Time) ([]imgBoard
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "%s\n", mode.label)
 		for ri, r := range rows {
-			fmt.Fprintf(&sb, "%d|%s|%d|%d|%d\n", ri+1, r.Name, r.Tier, r.Division, r.MMR)
+			fmt.Fprintf(&sb, "%d|%s|%d|%d|%d|%d|%t\n", ri+1, r.Name, r.Tier, r.Division, r.MMR, r.Delta, r.DeltaKnown)
 		}
 		sum := sha256.Sum256([]byte(sb.String()))
 		boards = append(boards, imgBoard{Filename: filename, Bytes: img, Hash: hex.EncodeToString(sum[:])})
@@ -568,7 +645,7 @@ func cmdRun(post, reset bool) error {
 	fmt.Printf("Targets: %d member(s)\n", len(targets))
 
 	st := loadState()
-	st.Version = 3
+	st.Version = 4
 
 	// Resolve names -> account IDs (cached; only new names hit the
 	// Epic lookup). A name that fails to resolve is skipped for this
@@ -673,6 +750,7 @@ func cmdRun(post, reset bool) error {
 		}
 	}
 
+	nowHist := time.Now()
 	perMode := map[int][]boardRow{}
 	for _, m := range members {
 		pid := string(rlapi.NewPlayerID(rlapi.PlatformEpic, m.accountID))
@@ -692,11 +770,27 @@ func cmdRun(post, reset bool) error {
 			if !ok || s.MatchesPlayed == 0 {
 				continue // not active in this mode this season
 			}
+			mmr := displayMMR(s)
+			// Record a thinned sample (one per ~30 min is
+			// plenty), then compare against one window ago.
+			key := historyKey(m.accountID, mode.id)
+			if pts := st.History[key]; len(pts) == 0 || nowHist.Sub(time.Unix(pts[len(pts)-1].T, 0)) >= 30*time.Minute {
+				st.History[key] = append(st.History[key], ratePoint{T: nowHist.Unix(), M: mmr})
+			}
+			delta, known := st.deltaSince(key, nowHist, mmr)
 			perMode[mode.id] = append(perMode[mode.id], boardRow{
 				Name: name, Tier: s.Tier, Division: s.Division,
-				MMR: displayMMR(s), Matches: s.MatchesPlayed,
+				MMR: mmr, Matches: s.MatchesPlayed,
+				Delta: delta, DeltaKnown: known,
 			})
 		}
+	}
+	{
+		keepIDs := map[string]bool{}
+		for _, m := range members {
+			keepIDs[m.accountID] = true
+		}
+		st.pruneHistory(nowHist, keepIDs)
 	}
 	for _, mode := range mainModes {
 		sortRows(perMode[mode.id])
@@ -737,7 +831,11 @@ func cmdRun(post, reset bool) error {
 			rows := perMode[mode.id]
 			fmt.Printf("[%s] %d player(s)\n", mode.label, len(rows))
 			for i, r := range rows {
-				fmt.Printf("  #%d %s — %s — %d\n", i+1, r.Name, tierLabel(r.Tier, r.Division), r.MMR)
+				line := fmt.Sprintf("  #%d %s — %s — %d", i+1, r.Name, tierLabel(r.Tier, r.Division), r.MMR)
+				if r.DeltaKnown {
+					line += fmt.Sprintf(" (%+d over %s)", r.Delta, deltaWindow)
+				}
+				fmt.Println(line)
 			}
 		}
 	}
@@ -751,19 +849,19 @@ func cmdRun(post, reset bool) error {
 func cmdDemo() error {
 	perMode := map[int][]boardRow{
 		11: {
-			{Name: "RocketTaro", Tier: 22, Division: 0, MMR: 1902, Matches: 210},
-			{Name: "Αyufa", Tier: 19, Division: 2, MMR: 1524, Matches: 89},
-			{Name: "さくら", Tier: 17, Division: 0, MMR: 1411, Matches: 64},
-			{Name: "zeekend_14", Tier: 15, Division: 1, MMR: 1003, Matches: 41},
-			{Name: "xX_ShadowSniper_99_Xx", Tier: 10, Division: 3, MMR: 768, Matches: 33},
+			{Name: "RocketTaro", Tier: 22, Division: 0, MMR: 1902, Matches: 210, Delta: 24, DeltaKnown: true},
+			{Name: "Αyufa", Tier: 19, Division: 2, MMR: 1524, Matches: 89, Delta: 57, DeltaKnown: true},
+			{Name: "さくら", Tier: 17, Division: 0, MMR: 1411, Matches: 64, Delta: 0, DeltaKnown: true},
+			{Name: "zeekend_14", Tier: 15, Division: 1, MMR: 1003, Matches: 41, Delta: -18, DeltaKnown: true},
+			{Name: "xX_ShadowSniper_99_Xx", Tier: 10, Division: 3, MMR: 768, Matches: 33, Delta: 112, DeltaKnown: true},
 			{Name: "mochi", Tier: 7, Division: 1, MMR: 512, Matches: 12},
-			{Name: "PlacementPro", Tier: 0, Division: 0, MMR: 498, Matches: 6},
-			{Name: "B2", Tier: 2, Division: 0, MMR: 214, Matches: 18},
+			{Name: "PlacementPro", Tier: 0, Division: 0, MMR: 498, Matches: 6, Delta: -25, DeltaKnown: true},
+			{Name: "B2", Tier: 2, Division: 0, MMR: 214, Matches: 18, Delta: 4, DeltaKnown: true},
 		},
 		13: {
-			{Name: "Αyufa", Tier: 18, Division: 3, MMR: 1403, Matches: 23},
-			{Name: "さくら", Tier: 16, Division: 2, MMR: 1250, Matches: 51},
-			{Name: "zeekend_14", Tier: 13, Division: 0, MMR: 940, Matches: 29},
+			{Name: "Αyufa", Tier: 18, Division: 3, MMR: 1403, Matches: 23, Delta: 39, DeltaKnown: true},
+			{Name: "さくら", Tier: 16, Division: 2, MMR: 1250, Matches: 51, Delta: -52, DeltaKnown: true},
+			{Name: "zeekend_14", Tier: 13, Division: 0, MMR: 940, Matches: 29, Delta: 15, DeltaKnown: true},
 		},
 		10: {},
 	}
