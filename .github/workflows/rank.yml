@@ -13,6 +13,10 @@ on:
         description: "Post/edit the Discord board (off = verification only, prints the ranking to the log)"
         type: boolean
         default: false
+      reset:
+        description: "With post: delete existing board messages and repost fresh (one-time reorder fix; later runs edit)"
+        type: boolean
+        default: false
 
 jobs:
   rank:
@@ -51,11 +55,10 @@ jobs:
           RL_RANK_TOKEN_FILE: state/token.txt
           RL_RANK_STATE_FILE: state/board.json
         run: |
-          if [ "${{ inputs.post }}" = "true" ]; then
-            go run ./cmd/rlrank run --post
-          else
-            go run ./cmd/rlrank run
-          fi
+          args=""
+          if [ "${{ inputs.post }}" = "true" ]; then args="$args --post"; fi
+          if [ "${{ inputs.reset }}" = "true" ]; then args="$args --reset"; fi
+          go run ./cmd/rlrank run $args
 
       - name: Save state
         if: always()

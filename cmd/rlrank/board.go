@@ -10,15 +10,19 @@ package main
 
 import (
 	"bytes"
+	"embed"
 	_ "embed"
 	"fmt"
+	"image"
 	"image/color"
 	"image/jpeg"
+	"image/png"
 	"sync"
 	"time"
 
 	"github.com/fogleman/gg"
 	"github.com/golang/freetype/truetype"
+	"golang.org/x/image/draw"
 	"golang.org/x/image/font"
 )
 
@@ -192,11 +196,6 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 				setColor(dc, 0x8E9BB5)
 			}
 			dc.DrawStringAnchored(fmt.Sprintf("%d", rank), boardPad+58, cy, 1, 0.5)
-			// Tier color chip.
-			r, g, b := rgb(tierColor(row.Tier))
-			dc.SetRGB(r, g, b)
-			dc.DrawRoundedRectangle(boardPad+86, cy-21, 12, 42, 6)
-			dc.Fill()
 			// Tier label is measured first: the rank text always
 			// stays fully visible, and the name truncates instead.
 			if err := setFont(dc, "regular", 30); err != nil {
@@ -204,8 +203,9 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			}
 			labelFull := tierLabel(row.Tier, row.Division)
 			labelW, _ := dc.MeasureString(labelFull)
-			const mmrZoneX = boardW - boardPad - 150
-			nameX := boardPad + 126
+			// Right zone holds [rank icon][MMR]; text stops before it.
+			const mmrZoneX = boardW - boardPad - 245
+			nameX := boardPad + 88
 			nameMaxW := mmrZoneX - 26 - labelW - nameX
 			if nameMaxW < 120 {
 				nameMaxW = 120
@@ -225,12 +225,18 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			setColor(dc, 0xB7C2D6)
 			label := truncateToWidth(dc, labelFull, mmrZoneX-(nameX+nameW+26))
 			dc.DrawStringAnchored(label, nameX+nameW+26, cy, 0, 0.5)
-			// Rating.
+			// Rating, with the real rank icon beside it.
 			if err := setFont(dc, "bold", 45); err != nil {
 				return nil, err
 			}
 			setColor(dc, 0xF4F6FA)
-			dc.DrawStringAnchored(fmt.Sprintf("%d", row.MMR), boardW-boardPad, cy, 1, 0.5)
+			mmrText := fmt.Sprintf("%d", row.MMR)
+			dc.DrawStringAnchored(mmrText, boardW-boardPad, cy, 1, 0.5)
+			if icon := rankIcon(row.Tier); icon != nil {
+				mmrW, _ := dc.MeasureString(mmrText)
+				iconRight := boardW - boardPad - mmrW - 16
+				dc.DrawImageAnchored(icon, int(iconRight), int(cy), 1, 0.5)
+			}
 			// Divider.
 			dc.SetRGBA(1, 1, 1, 0.05)
 			dc.DrawRectangle(boardPad, y0+rowH-1, boardW-2*boardPad, 1)
@@ -253,6 +259,54 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 	}
 	return buf.Bytes(), nil
 }
+
+// ------------------------------------------------------------ rank icons
+
+// The real in-game rank icons, one per Tier (0=Unranked .. 22=SSL),
+// sourced from the Rocket League Wiki (same asset source the shop
+// bot uses for the Credits icon). Icons differ per Tier — Bronze I
+// vs II vs III are different images — exactly as in game. (Within a
+// Tier, Divisions I–IV share the icon in game too; the division is
+// text there and here.)
+//
+//go:embed assets/ranks/tier*.png
+var rankIconFS embed.FS
+
+const rankIconSize = 54
+
+var rankIcons [23]image.Image
+var rankIconsErr error
+var rankIconsOnce sync.Once
+
+func loadRankIcons() {
+	for tier := 0; tier < len(rankIcons); tier++ {
+		name := fmt.Sprintf("assets/ranks/tier%02d.png", tier)
+		f, err := rankIconFS.Open(name)
+		if err != nil {
+			rankIconsErr = err
+			return
+		}
+		img, err := png.Decode(f)
+		f.Close()
+		if err != nil {
+			rankIconsErr = err
+			return
+		}
+		scaled := image.NewRGBA(image.Rect(0, 0, rankIconSize, rankIconSize))
+		draw.ApproxBiLinear.Scale(scaled, scaled.Bounds(), img, img.Bounds(), draw.Over, nil)
+		rankIcons[tier] = scaled
+	}
+}
+
+func rankIcon(tier int) image.Image {
+	rankIconsOnce.Do(loadRankIcons)
+	if rankIconsErr != nil || tier < 0 || tier >= len(rankIcons) {
+		return nil
+	}
+	return rankIcons[tier]
+}
+
+// ---------------------------------------------------------------
 
 func colorFromHex(hex int) color.Color {
 	r, g, b := rgb(hex)

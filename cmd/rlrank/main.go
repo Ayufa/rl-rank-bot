@@ -108,13 +108,14 @@ func tierColor(tier int) int {
 
 // ------------------------------------------------------------ playlists
 
-// mainModes are the playlists that get their own ranking board.
+// mainModes are the playlists that get their own ranking board, in
+// posting order (channel order follows post order: 3v3, 2v2, 1v1).
 var mainModes = []struct {
 	id    int
 	label string
 }{
-	{11, "2v2"},
 	{13, "3v3"},
+	{11, "2v2"},
 	{10, "1v1"},
 }
 
@@ -572,7 +573,7 @@ func chunkIDs(ids []rlapi.PlayerID, n int) [][]rlapi.PlayerID {
 	return out
 }
 
-func cmdRun(post bool) error {
+func cmdRun(post, reset bool) error {
 	targets, err := loadTargets()
 	if err != nil {
 		return err
@@ -701,6 +702,22 @@ func cmdRun(post bool) error {
 		if webhook == "" {
 			return fmt.Errorf("DISCORD_WEBHOOK_URL is not set")
 		}
+		if reset && len(st.BoardIDs) > 0 {
+			// One-time reorder/repair: Discord message order in a
+			// channel follows post time and cannot be changed by
+			// editing, so the old boards are deleted and reposted
+			// in the current mode order. Later runs edit in place.
+			n := 0
+			for _, id := range st.BoardIDs {
+				if err := deleteMessage(webhook, id); err != nil {
+					fmt.Printf("WARN: reset delete %s: %v\n", id, err)
+				} else {
+					n++
+				}
+			}
+			fmt.Printf("Reset: deleted %d old board(s); reposting fresh.\n", n)
+			st.BoardIDs, st.BoardHashes = nil, nil
+		}
 		if err := syncBoards(webhook, &st, boards); err != nil {
 			return err
 		}
@@ -774,13 +791,16 @@ func main() {
 	case "demo":
 		err = cmdDemo()
 	case "run":
-		post := false
+		post, reset := false, false
 		for _, a := range os.Args[2:] {
 			if a == "--post" {
 				post = true
 			}
+			if a == "--reset" {
+				reset = true
+			}
 		}
-		err = cmdRun(post)
+		err = cmdRun(post, reset)
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
