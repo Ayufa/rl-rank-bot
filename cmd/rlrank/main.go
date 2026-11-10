@@ -1,4 +1,4 @@
-// rlrank: Rocket League member ranking board for Discord.
+// rlrank: Rocket League member ranking boards for Discord.
 //
 // Fully programmatic pipeline (no manual fetching):
 //  1. EGS refresh-token login (a DEDICATED login for this bot only,
@@ -7,18 +7,19 @@
 //     ID (cached in state; later runs resolve by ID, so renames do
 //     not break tracking).
 //  3. PsyNet (via dank/rlapi) GetPlayersSkills for ALL members in
-//     batched calls: per-playlist Tier / Division / MMR / WinStreak /
-//     MatchesPlayed.
-//  4. Members are ranked by a representative playlist (2v2 first,
-//     then 3v3, 1v1, then the highest-MMR active playlist) and shown
-//     as one-line entries on Discord "ranking board" message(s) that
-//     are EDITED in place on later runs.
+//     batched calls: per-playlist Tier / Division / MMR / Matches.
+//  4. For each main playlist (2v2 / 3v3 / 1v1) the members with games
+//     this season are ranked by MMR and rendered as a designed image
+//     board (board.go) showing only position, name, rank and rating.
+//     The board messages are EDITED in place on later runs; boards
+//     whose ranking did not change are left untouched.
 //
 // Usage:
 //
 //	rlrank auth-url            print the Epic login URL for `auth-code`
 //	rlrank auth-code <code>    exchange an authorization code, save token
 //	rlrank run [--post]        fetch once; --post also updates Discord
+//	rlrank demo                render sample boards to ./out (no login)
 //
 // Environment:
 //
@@ -31,6 +32,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -38,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,7 +48,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/dank/rlapi"
 )
@@ -81,39 +83,40 @@ func tierLabel(tier, division int) string {
 	return name
 }
 
-const rankingColor = 0xE8B93C // gold
+func tierColor(tier int) int {
+	switch {
+	case tier >= 22:
+		return 0xF5F5F5 // Supersonic Legend: white
+	case tier >= 19:
+		return 0xE33E4E // Grand Champion: red
+	case tier >= 16:
+		return 0xB565D8 // Champion: purple
+	case tier >= 13:
+		return 0x3E7BDE // Diamond: blue
+	case tier >= 10:
+		return 0x35C4C9 // Platinum: cyan
+	case tier >= 7:
+		return 0xE8B93C // Gold
+	case tier >= 4:
+		return 0xA8B0B8 // Silver
+	case tier >= 1:
+		return 0xB0722E // Bronze
+	default:
+		return 0x808080
+	}
+}
 
 // ------------------------------------------------------------ playlists
 
-type playlistInfo struct {
+// mainModes are the playlists that get their own ranking board.
+var mainModes = []struct {
 	id    int
-	label string // detail label (kept from v1)
-	short string // compact label for ranking lines
-	main  bool
+	label string
+}{
+	{11, "2v2"},
+	{13, "3v3"},
+	{10, "1v1"},
 }
-
-var playlistOrder = []playlistInfo{
-	{11, "⭐ 2v2", "2v2", true},
-	{13, "3v3", "3v3", true},
-	{10, "1v1", "1v1", true},
-	{34, "Tournament", "大会", false},
-	{23, "Hoops", "Hoops", false},
-	{27, "Rumble", "Rumble", false},
-	{28, "Dropshot", "Dropshot", false},
-	{29, "Snow Day", "Snow Day", false},
-}
-
-var playlistShort = func() map[int]string {
-	m := map[int]string{}
-	for _, pi := range playlistOrder {
-		m[pi.id] = pi.short
-	}
-	return m
-}()
-
-// repPreference: order in which an active playlist (matches played
-// this season > 0) becomes a member's representative playlist.
-var repPreference = []int{11, 13, 10, 34, 27, 23, 28, 29}
 
 // displayMMR converts a PsyNet skill into the rating the game shows.
 // PsyNet's MMR field equals Mu in raw responses; the display rating
@@ -127,32 +130,15 @@ func displayMMR(s rlapi.Skill) int {
 
 // ---------------------------------------------------------------- state
 
-type skillSnapshot struct {
-	Tier     int `json:"tier"`
-	Division int `json:"division"`
-	MMR      int `json:"mmr"`
-	Matches  int `json:"matches"`
-	Streak   int `json:"streak"`
-}
-
-type memberState struct {
-	Name     string                   `json:"name,omitempty"`
-	Prev     map[string]skillSnapshot `json:"prev,omitempty"`
-	PrevRank int                      `json:"prev_rank,omitempty"`
-}
-
 type boardState struct {
-	Version     int                     `json:"version,omitempty"`
-	BoardIDs    []string                `json:"board_ids,omitempty"`
-	BoardHashes []string                `json:"board_hashes,omitempty"`
-	Resolved    map[string]string       `json:"resolved,omitempty"` // target name -> account ID
-	Members     map[string]*memberState `json:"members,omitempty"`  // account ID -> state
-	UpdatedAt   string                  `json:"updated_at,omitempty"`
+	Version     int               `json:"version,omitempty"`
+	BoardIDs    []string          `json:"board_ids,omitempty"`
+	BoardHashes []string          `json:"board_hashes,omitempty"`
+	Resolved    map[string]string `json:"resolved,omitempty"` // target name -> account ID
+	UpdatedAt   string            `json:"updated_at,omitempty"`
 
-	// Legacy v1 fields (single-player board), migrated on load.
-	LegacyMessageID string                   `json:"message_id,omitempty"`
-	LegacyAccountID string                   `json:"account_id,omitempty"`
-	LegacyPrev      map[string]skillSnapshot `json:"prev,omitempty"`
+	// Legacy v1 field (single-player text board), deleted once.
+	LegacyMessageID string `json:"message_id,omitempty"`
 }
 
 func stateFilePath() string {
@@ -170,18 +156,6 @@ func loadState() boardState {
 	}
 	if st.Resolved == nil {
 		st.Resolved = map[string]string{}
-	}
-	if st.Members == nil {
-		st.Members = map[string]*memberState{}
-	}
-	// Migrate the v1 single-player snapshot so the first ranked run
-	// still shows MMR deltas for the original member.
-	if st.LegacyAccountID != "" && len(st.LegacyPrev) > 0 {
-		if _, ok := st.Members[st.LegacyAccountID]; !ok {
-			st.Members[st.LegacyAccountID] = &memberState{Prev: st.LegacyPrev}
-		}
-		st.LegacyPrev = nil
-		st.LegacyAccountID = ""
 	}
 	return st
 }
@@ -356,71 +330,56 @@ func connect() (*rlapi.TokenResponse, *rlapi.PsyNetRPC, error) {
 
 // -------------------------------------------------------------- discord
 
-type embedField struct {
-	Name   string `json:"name"`
-	Value  string `json:"value"`
-	Inline bool   `json:"inline"`
-}
-
-type embed struct {
-	Title       string       `json:"title"`
-	Description string       `json:"description,omitempty"`
-	Color       int          `json:"color"`
-	Fields      []embedField `json:"fields,omitempty"`
-	Footer      *embedFooter `json:"footer,omitempty"`
-}
-
-type embedFooter struct {
-	Text string `json:"text"`
-}
-
-func webhookCall(method, url string, payload any) (int, []byte, error) {
-	var body io.Reader
-	if payload != nil {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			return 0, nil, err
-		}
-		body = strings.NewReader(string(b))
+// sendBoardImage posts (messageID == "") or edits one image board
+// message and returns its message ID. The image is the whole post
+// (image-only, like the shop bot). The multipart shape — payload_json
+// with attachments[0] bound to files[0] — is the one proven by
+// rl-shop-bot, including PATCH edits that swap the image.
+func sendBoardImage(webhook, messageID string, b imgBoard) (string, error) {
+	fields := map[string]any{
+		"attachments": []map[string]any{{"id": 0, "filename": b.Filename}},
 	}
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return 0, nil, err
-	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-	out, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, out, nil
-}
-
-// postOrEdit posts a new board message, or edits the recorded one.
-func postOrEdit(webhook, messageID string, emb embed) (string, error) {
-	payload := map[string]any{"username": "RL Rank Live", "embeds": []embed{emb}}
+	method, suffix := "POST", "?wait=true"
 	if messageID != "" {
-		status, out, err := webhookCall("PATCH", webhook+"/messages/"+messageID, payload)
-		if err != nil {
-			return "", err
-		}
-		if status == http.StatusOK {
-			return messageID, nil
-		}
-		if status != http.StatusNotFound {
-			return "", fmt.Errorf("edit board: HTTP %d: %s", status, string(out))
-		}
-		// Message was deleted in Discord: fall through and repost.
+		method, suffix = "PATCH", "/messages/"+messageID+"?wait=true"
+	} else {
+		fields["username"] = "RL Rank Live"
 	}
-	status, out, err := webhookCall("POST", webhook+"?wait=true", payload)
+	payload, _ := json.Marshal(fields)
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("payload_json", string(payload))
+	fw, err := mw.CreateFormFile("files[0]", b.Filename)
 	if err != nil {
 		return "", err
 	}
-	if status != http.StatusOK && status != http.StatusCreated {
-		return "", fmt.Errorf("post board: HTTP %d: %s", status, string(out))
+	if _, err := fw.Write(b.Bytes); err != nil {
+		return "", err
+	}
+	if err := mw.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(method, webhook+suffix, &buf)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if method == "PATCH" && resp.StatusCode == http.StatusNotFound {
+		// Message was deleted in Discord: repost as a new board.
+		return sendBoardImage(webhook, "", b)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("discord %s board: HTTP %d: %s", method, resp.StatusCode, string(out))
+	}
+	if messageID != "" {
+		return messageID, nil
 	}
 	var msg struct {
 		ID string `json:"id"`
@@ -433,181 +392,44 @@ func postOrEdit(webhook, messageID string, emb embed) (string, error) {
 
 // deleteMessage removes a webhook message; already-gone counts as ok.
 func deleteMessage(webhook, messageID string) error {
-	status, out, err := webhookCall("DELETE", webhook+"/messages/"+messageID, nil)
+	req, err := http.NewRequest("DELETE", webhook+"/messages/"+messageID, nil)
 	if err != nil {
 		return err
 	}
-	if status == http.StatusNoContent || status == http.StatusNotFound {
+	resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
-	return fmt.Errorf("delete message %s: HTTP %d: %s", messageID, status, string(out))
-}
-
-// -------------------------------------------------------------- ranking
-
-type rankEntry struct {
-	AccountID string
-	Name      string
-	Ranked    bool
-	Playlist  int
-	Tier      int
-	Division  int
-	MMR       int
-	Matches   int
-	Streak    int
-	MMRDelta  int
-	HasDelta  bool
-	PrevRank  int
-	IsNew     bool
-	Rank      int
-}
-
-// pickRepresentative chooses the playlist a member is ranked by: the
-// first preferred playlist with matches played this season, else the
-// highest-MMR active playlist. Returns -1 when nothing is active.
-func pickRepresentative(byPlaylist map[int]rlapi.Skill) (int, bool) {
-	for _, id := range repPreference {
-		if s, ok := byPlaylist[id]; ok && s.MatchesPlayed > 0 {
-			return id, true
-		}
-	}
-	best := -1
-	bestMMR := 0
-	for id, s := range byPlaylist {
-		if s.MatchesPlayed > 0 {
-			if m := displayMMR(s); best == -1 || m > bestMMR {
-				best, bestMMR = id, m
-			}
-		}
-	}
-	return best, best >= 0
-}
-
-func rankLine(e rankEntry) string {
-	medal := ""
-	switch e.Rank {
-	case 1:
-		medal = "🥇 "
-	case 2:
-		medal = "🥈 "
-	case 3:
-		medal = "🥉 "
-	}
-	pos := ""
-	if e.PrevRank > 0 {
-		if d := e.PrevRank - e.Rank; d > 0 {
-			pos = fmt.Sprintf(" ⬆%d", d)
-		} else if d < 0 {
-			pos = fmt.Sprintf(" ⬇%d", -d)
-		}
-	}
-	delta := ""
-	if e.HasDelta {
-		if e.MMRDelta > 0 {
-			delta = fmt.Sprintf(" ▲+%d", e.MMRDelta)
-		} else if e.MMRDelta < 0 {
-			delta = fmt.Sprintf(" ▼%d", -e.MMRDelta)
-		}
-	}
-	streak := ""
-	if e.Streak >= 2 {
-		streak = fmt.Sprintf(" 🔥%d連勝", e.Streak)
-	}
-	fresh := ""
-	if e.IsNew {
-		fresh = " 🆕"
-	}
-	short := playlistShort[e.Playlist]
-	if short == "" {
-		short = fmt.Sprintf("PL%d", e.Playlist)
-	}
-	return fmt.Sprintf("**%d.**%s %s**%s** — %s（%s） **%d**%s%s%s",
-		e.Rank, pos, medal, e.Name, tierLabel(e.Tier, e.Division), short, e.MMR, delta, streak, fresh)
-}
-
-type boardMsg struct {
-	Embed embed
-	Hash  string
-}
-
-// buildBoards packs ranking lines into board messages. The header
-// (update time) lives only in the first embed and is excluded from
-// the content hash, so unchanged rankings do not trigger an edit and
-// the shown time reads as "when the ranking last changed".
-func buildBoards(ranked []rankEntry, unranked []rankEntry, memberCount int) []boardMsg {
-	var lines []string
-	for _, e := range ranked {
-		lines = append(lines, rankLine(e))
-	}
-	if len(unranked) > 0 {
-		lines = append(lines, "**―― 今季データなし ――**")
-		for _, e := range unranked {
-			lines = append(lines, fmt.Sprintf("・**%s**", e.Name))
-		}
-	}
-	if len(lines) == 0 {
-		lines = append(lines, "（表示できるメンバーがいません）")
-	}
-
-	const maxDesc = 3400 // runes, safely under Discord's 4096
-	var groups [][]string
-	var cur []string
-	curLen := 0
-	for _, ln := range lines {
-		l := utf8.RuneCountInString(ln) + 1
-		if len(cur) > 0 && curLen+l > maxDesc {
-			groups = append(groups, cur)
-			cur, curLen = nil, 0
-		}
-		cur = append(cur, ln)
-		curLen += l
-	}
-	if len(cur) > 0 {
-		groups = append(groups, cur)
-	}
-
-	boards := make([]boardMsg, 0, len(groups))
-	for i, g := range groups {
-		h := sha256.Sum256([]byte(strings.Join(g, "\n")))
-		emb := embed{Color: rankingColor}
-		if i == 0 {
-			emb.Title = "🏆 メンバーランキング"
-			header := fmt.Sprintf("🕒 ランキング最終更新 <t:%d:R> ・ 対象 %d人\n", time.Now().Unix(), memberCount)
-			emb.Description = header + strings.Join(g, "\n")
-		} else {
-			emb.Title = "🏆 メンバーランキング（続き）"
-			emb.Description = strings.Join(g, "\n")
-		}
-		if i == len(groups)-1 {
-			emb.Footer = &embedFooter{Text: "RL Rank Live • 代表モードは2v2優先で自動選択 • データ：Rocket League公式サーバー（PsyNet）"}
-		}
-		boards = append(boards, boardMsg{Embed: emb, Hash: hex.EncodeToString(h[:])})
-	}
-	return boards
+	return fmt.Errorf("delete message %s: HTTP %d: %s", messageID, resp.StatusCode, string(out))
 }
 
 // syncBoards posts/edits/deletes Discord messages to match boards.
-func syncBoards(webhook string, st *boardState, boards []boardMsg) error {
-	edited := 0
+func syncBoards(webhook string, st *boardState, boards []imgBoard) error {
+	written := 0
 	for i, b := range boards {
 		if i < len(st.BoardIDs) {
 			if i < len(st.BoardHashes) && st.BoardHashes[i] == b.Hash {
-				continue // unchanged: leave the message (and its time) alone
+				continue // unchanged ranking: leave message (and its time) alone
 			}
-			id, err := postOrEdit(webhook, st.BoardIDs[i], b.Embed)
+			id, err := sendBoardImage(webhook, st.BoardIDs[i], b)
 			if err != nil {
 				return err
 			}
 			st.BoardIDs[i] = id
-			edited++
+			written++
 			continue
 		}
-		id, err := postOrEdit(webhook, "", b.Embed)
+		id, err := sendBoardImage(webhook, "", b)
 		if err != nil {
 			return err
 		}
 		st.BoardIDs = append(st.BoardIDs, id)
-		edited++
+		written++
 	}
 	// Shrink: remove surplus boards from earlier, larger rankings.
 	for len(st.BoardIDs) > len(boards) {
@@ -621,21 +443,85 @@ func syncBoards(webhook string, st *boardState, boards []boardMsg) error {
 	for i, b := range boards {
 		st.BoardHashes[i] = b.Hash
 	}
-	if edited == 0 {
-		fmt.Println("Ranking unchanged: boards left untouched.")
+	if written == 0 {
+		fmt.Println("Rankings unchanged: boards left untouched.")
 	} else {
-		fmt.Printf("Boards synced: %d message(s), %d written.\n", len(boards), edited)
+		fmt.Printf("Boards synced: %d message(s), %d written.\n", len(boards), written)
 	}
-	// One-time cleanup of the v1 single-player board.
+	// One-time cleanup of any pre-image (v1/v2 text) board.
 	if st.LegacyMessageID != "" {
 		if err := deleteMessage(webhook, st.LegacyMessageID); err != nil {
 			fmt.Printf("WARN: could not delete legacy board: %v\n", err)
 		} else {
-			fmt.Printf("Deleted legacy single-player board %s\n", st.LegacyMessageID)
+			fmt.Printf("Deleted legacy board %s\n", st.LegacyMessageID)
 			st.LegacyMessageID = ""
 		}
 	}
 	return nil
+}
+
+// -------------------------------------------------------------- ranking
+
+// buildImageBoards renders every mode's ranking, splitting a mode
+// into several boards when it has more than rowsPerBoard members.
+// The ordering is deterministic (2v2, 3v3, 1v1, then part 2, ...)
+// so positional state (message IDs / hashes) lines up across runs.
+func buildImageBoards(perMode map[int][]boardRow, updated time.Time) ([]imgBoard, error) {
+	var boards []imgBoard
+	for _, mode := range mainModes {
+		rows := perMode[mode.id]
+		chunks := [][]boardRow{rows}
+		if len(rows) > rowsPerBoard {
+			chunks = nil
+			for i := 0; i < len(rows); i += rowsPerBoard {
+				end := i + rowsPerBoard
+				if end > len(rows) {
+					end = len(rows)
+				}
+				chunks = append(chunks, rows[i:end])
+			}
+		}
+		for ci, chunk := range chunks {
+			label := mode.label
+			filename := fmt.Sprintf("ranking-%s.jpg", strings.ToLower(mode.label))
+			if len(chunks) > 1 {
+				label = fmt.Sprintf("%s (%d/%d)", mode.label, ci+1, len(chunks))
+				filename = fmt.Sprintf("ranking-%s-%d.jpg", strings.ToLower(mode.label), ci+1)
+			}
+			img, err := renderBoard(label, chunk, ci*rowsPerBoard+1, updated)
+			if err != nil {
+				return nil, err
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "%s\n", mode.label)
+			base := ci * rowsPerBoard
+			for ri, r := range chunk {
+				fmt.Fprintf(&sb, "%d|%s|%d|%d|%d\n", base+ri+1, r.Name, r.Tier, r.Division, r.MMR)
+			}
+			sum := sha256.Sum256([]byte(sb.String()))
+			boards = append(boards, imgBoard{Filename: filename, Bytes: img, Hash: hex.EncodeToString(sum[:])})
+		}
+	}
+	return boards, nil
+}
+
+func sortRows(rows []boardRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if a.MMR != b.MMR {
+			return a.MMR > b.MMR
+		}
+		if a.Tier != b.Tier {
+			return a.Tier > b.Tier
+		}
+		if a.Division != b.Division {
+			return a.Division > b.Division
+		}
+		if a.Matches != b.Matches {
+			return a.Matches > b.Matches
+		}
+		return a.Name < b.Name
+	})
 }
 
 // ----------------------------------------------------------------- cmds
@@ -701,7 +587,7 @@ func cmdRun(post bool) error {
 	fmt.Printf("Targets: %d member(s)\n", len(targets))
 
 	st := loadState()
-	st.Version = 2
+	st.Version = 3
 
 	// Resolve names -> account IDs (cached; only new names hit the
 	// Epic lookup). A name that fails to resolve is skipped for this
@@ -776,86 +662,39 @@ func cmdRun(post bool) error {
 		}
 	}
 
-	var ranked, unranked []rankEntry
+	perMode := map[int][]boardRow{}
 	for _, m := range members {
 		pid := string(rlapi.NewPlayerID(rlapi.PlatformEpic, m.accountID))
-		ms := st.Members[m.accountID]
-		if ms == nil {
-			ms = &memberState{}
-			st.Members[m.accountID] = ms
-		}
-		if ms.Prev == nil {
-			ms.Prev = map[string]skillSnapshot{}
-		}
-		// Display name priority: live profile > Epic lookup > last
-		// known > the target list spelling.
 		name := nameByPlayer[pid]
 		if name == "" {
 			name = m.epicName
 		}
 		if name == "" {
-			name = ms.Name
-		}
-		if name == "" {
 			name = m.targetName
 		}
-		ms.Name = name
-
-		skills := skillsByPlayer[pid]
 		byPlaylist := map[int]rlapi.Skill{}
-		for _, s := range skills {
+		for _, s := range skillsByPlayer[pid] {
 			byPlaylist[s.Playlist] = s
 		}
-		repID, active := pickRepresentative(byPlaylist)
-		e := rankEntry{AccountID: m.accountID, Name: name, PrevRank: ms.PrevRank, IsNew: len(ms.Prev) == 0}
-		if active {
-			s := byPlaylist[repID]
-			mmr := displayMMR(s)
-			e.Ranked = true
-			e.Playlist = repID
-			e.Tier, e.Division = s.Tier, s.Division
-			e.MMR, e.Matches, e.Streak = mmr, s.MatchesPlayed, s.WinStreak
-			if prev, ok := ms.Prev[fmt.Sprintf("%d", repID)]; ok {
-				e.HasDelta = true
-				e.MMRDelta = mmr - prev.MMR
+		for _, mode := range mainModes {
+			s, ok := byPlaylist[mode.id]
+			if !ok || s.MatchesPlayed == 0 {
+				continue // not active in this mode this season
 			}
-			ranked = append(ranked, e)
-		} else {
-			unranked = append(unranked, e)
+			perMode[mode.id] = append(perMode[mode.id], boardRow{
+				Name: name, Tier: s.Tier, Division: s.Division,
+				MMR: displayMMR(s), Matches: s.MatchesPlayed,
+			})
 		}
-		// Snapshot every returned playlist for future deltas.
-		for _, s := range skills {
-			key := fmt.Sprintf("%d", s.Playlist)
-			ms.Prev[key] = skillSnapshot{Tier: s.Tier, Division: s.Division, MMR: displayMMR(s), Matches: s.MatchesPlayed, Streak: s.WinStreak}
-		}
+	}
+	for _, mode := range mainModes {
+		sortRows(perMode[mode.id])
 	}
 
-	sort.Slice(ranked, func(i, j int) bool {
-		a, b := ranked[i], ranked[j]
-		if a.MMR != b.MMR {
-			return a.MMR > b.MMR
-		}
-		if a.Tier != b.Tier {
-			return a.Tier > b.Tier
-		}
-		if a.Division != b.Division {
-			return a.Division > b.Division
-		}
-		if a.Matches != b.Matches {
-			return a.Matches > b.Matches
-		}
-		return a.Name < b.Name
-	})
-	for i := range ranked {
-		ranked[i].Rank = i + 1
-		st.Members[ranked[i].AccountID].PrevRank = i + 1
+	boards, err := buildImageBoards(perMode, time.Now())
+	if err != nil {
+		return fmt.Errorf("render boards: %w", err)
 	}
-	sort.Slice(unranked, func(i, j int) bool { return unranked[i].Name < unranked[j].Name })
-	for _, e := range unranked {
-		st.Members[e.AccountID].PrevRank = 0
-	}
-
-	boards := buildBoards(ranked, unranked, len(members))
 
 	if post {
 		webhook := strings.TrimSpace(os.Getenv("DISCORD_WEBHOOK_URL"))
@@ -866,9 +705,13 @@ func cmdRun(post bool) error {
 			return err
 		}
 	} else {
-		fmt.Println("Verification mode: ranking not posted. Rendered board(s):")
-		for _, b := range boards {
-			fmt.Printf("--- %s ---\n%s\n", b.Embed.Title, b.Embed.Description)
+		fmt.Println("Verification mode: boards not posted. Rankings:")
+		for _, mode := range mainModes {
+			rows := perMode[mode.id]
+			fmt.Printf("[%s] %d player(s)\n", mode.label, len(rows))
+			for i, r := range rows {
+				fmt.Printf("  #%d %s — %s — %d\n", i+1, r.Name, tierLabel(r.Tier, r.Division), r.MMR)
+			}
 		}
 	}
 
@@ -876,9 +719,50 @@ func cmdRun(post bool) error {
 	return saveState(st)
 }
 
+// cmdDemo renders sample boards locally (no login, no network) so
+// the design can be checked before anything is posted.
+func cmdDemo() error {
+	perMode := map[int][]boardRow{
+		11: {
+			{Name: "RocketTaro", Tier: 22, Division: 0, MMR: 1902, Matches: 210},
+			{Name: "Αyufa", Tier: 19, Division: 2, MMR: 1524, Matches: 89},
+			{Name: "さくら", Tier: 17, Division: 0, MMR: 1411, Matches: 64},
+			{Name: "zeekend_14", Tier: 15, Division: 1, MMR: 1003, Matches: 41},
+			{Name: "xX_ShadowSniper_99_Xx", Tier: 10, Division: 3, MMR: 768, Matches: 33},
+			{Name: "mochi", Tier: 7, Division: 1, MMR: 512, Matches: 12},
+			{Name: "PlacementPro", Tier: 0, Division: 0, MMR: 498, Matches: 6},
+			{Name: "B2", Tier: 2, Division: 0, MMR: 214, Matches: 18},
+		},
+		13: {
+			{Name: "Αyufa", Tier: 18, Division: 3, MMR: 1403, Matches: 23},
+			{Name: "さくら", Tier: 16, Division: 2, MMR: 1250, Matches: 51},
+			{Name: "zeekend_14", Tier: 13, Division: 0, MMR: 940, Matches: 29},
+		},
+		10: {},
+	}
+	for _, mode := range mainModes {
+		sortRows(perMode[mode.id])
+	}
+	boards, err := buildImageBoards(perMode, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll("out", 0o755); err != nil {
+		return err
+	}
+	for _, b := range boards {
+		p := filepath.Join("out", "demo-"+b.Filename)
+		if err := os.WriteFile(p, b.Bytes, 0o644); err != nil {
+			return err
+		}
+		fmt.Println("wrote", p)
+	}
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: rlrank <auth-url|auth-code|run> [--post]")
+		fmt.Fprintln(os.Stderr, "usage: rlrank <auth-url|auth-code|run|demo> [--post]")
 		os.Exit(2)
 	}
 	var err error
@@ -887,6 +771,8 @@ func main() {
 		err = cmdAuthURL()
 	case "auth-code":
 		err = cmdAuthCode(os.Args[2:])
+	case "demo":
+		err = cmdDemo()
 	case "run":
 		post := false
 		for _, a := range os.Args[2:] {

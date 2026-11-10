@@ -1,4 +1,5 @@
 /token.txt
 /state/
+/out/
 *.exe
 /rlrank
