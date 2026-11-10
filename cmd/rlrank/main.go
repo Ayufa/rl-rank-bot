@@ -410,13 +410,13 @@ func deleteMessage(webhook, messageID string) error {
 }
 
 // syncBoards posts/edits/deletes Discord messages to match boards.
+// Every board is re-edited on every run (the owner's choice), so
+// the time printed on each board is always the last CHECK time,
+// even when no ranking changed.
 func syncBoards(webhook string, st *boardState, boards []imgBoard) error {
 	written := 0
 	for i, b := range boards {
 		if i < len(st.BoardIDs) {
-			if i < len(st.BoardHashes) && st.BoardHashes[i] == b.Hash {
-				continue // unchanged ranking: leave message (and its time) alone
-			}
 			id, err := sendBoardImage(webhook, st.BoardIDs[i], b)
 			if err != nil {
 				return err
@@ -444,11 +444,7 @@ func syncBoards(webhook string, st *boardState, boards []imgBoard) error {
 	for i, b := range boards {
 		st.BoardHashes[i] = b.Hash
 	}
-	if written == 0 {
-		fmt.Println("Rankings unchanged: boards left untouched.")
-	} else {
-		fmt.Printf("Boards synced: %d message(s), %d written.\n", len(boards), written)
-	}
+	fmt.Printf("Boards synced: %d message(s), %d written.\n", len(boards), written)
 	// One-time cleanup of any pre-image (v1/v2 text) board.
 	if st.LegacyMessageID != "" {
 		if err := deleteMessage(webhook, st.LegacyMessageID); err != nil {
