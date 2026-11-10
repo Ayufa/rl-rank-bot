@@ -118,12 +118,17 @@ type imgBoard struct {
 }
 
 const (
-	boardW       = 1080.0
-	boardPad     = 54.0
-	headerH      = 140.0
-	rowH         = 76.0
-	footerH      = 58.0
-	rowsPerBoard = 30
+	boardW   = 1080.0
+	boardPad = 54.0
+	headerH  = 140.0
+	rowH     = 76.0
+	footerH  = 58.0
+	// rowsPerBoard is both the split size AND the fixed board
+	// height in rows: every board renders at exactly this many
+	// rows tall (padded when a mode has fewer active members),
+	// so all boards share one size and aspect ratio no matter
+	// how the headcount changes.
+	rowsPerBoard = 12
 )
 
 var posColors = map[int]int{1: 0xF2C14E, 2: 0xC7CEDA, 3: 0xD89A6A}
@@ -133,11 +138,9 @@ var posColors = map[int]int{1: 0xF2C14E, 2: 0xC7CEDA, 3: 0xD89A6A}
 // exceeds 1 on continuation boards of a split ranking).
 func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time) ([]byte, error) {
 	n := len(rows)
-	slots := n
-	if slots == 0 {
-		slots = 1
-	}
-	h := int(headerH + float64(slots)*rowH + footerH)
+	// Fixed canvas height (see rowsPerBoard): shorter rankings
+	// simply leave empty board space above the footer.
+	h := int(headerH + rowsPerBoard*rowH + footerH)
 	dc := gg.NewContext(int(boardW), h)
 
 	// Background: vertical navy gradient.
@@ -175,7 +178,7 @@ func renderBoard(mode string, rows []boardRow, startRank int, updated time.Time)
 			return nil, err
 		}
 		setColor(dc, 0x8E9BB5)
-		dc.DrawStringAnchored("今季プレイヤーなし", boardW/2, headerH+rowH/2, 0.5, 0.5)
+		dc.DrawStringAnchored("今季プレイヤーなし", boardW/2, headerH+(rowsPerBoard*rowH)/2, 0.5, 0.5)
 	} else {
 		for i, row := range rows {
 			y0 := headerH + float64(i)*rowH
