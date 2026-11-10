@@ -1,0 +1,65 @@
+name: RL Rank Live Board
+
+# Dedicated rank-tracker bot, fully separate from rl-shop-bot:
+# its own repository, its own EGS login (RL_RANK_REFRESH_TOKEN),
+# its own state cache and its own Discord webhook.
+#
+# Triggering is dispatch-only for now (the live-polling cadence is a
+# separate setup step, like the shop bot's Cloud Scheduler).
+on:
+  workflow_dispatch:
+    inputs:
+      post:
+        description: "Post/edit the Discord board (off = verification only, prints skills to the log)"
+        type: boolean
+        default: false
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # State = rotated EGS refresh token + board message id + last
+      # seen skills (for delta display). Refreshed by every run.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: rlrank-state-${{ github.run_id }}
+          restore-keys: |
+            rlrank-state-
+
+      - name: Seed token from secret (first run only)
+        env:
+          RL_RANK_REFRESH_TOKEN: ${{ secrets.RL_RANK_REFRESH_TOKEN }}
+        run: |
+          mkdir -p state
+          if [ ! -s state/token.txt ] && [ -n "$RL_RANK_REFRESH_TOKEN" ]; then
+            printf '%s' "$RL_RANK_REFRESH_TOKEN" > state/token.txt
+          fi
+
+      - name: Fetch rank and update board
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RL_RANK_TOKEN_FILE: state/token.txt
+          RL_RANK_STATE_FILE: state/board.json
+        run: |
+          if [ "${{ inputs.post }}" = "true" ]; then
+            go run ./cmd/rlrank run --post
+          else
+            go run ./cmd/rlrank run
+          fi
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: rlrank-state-${{ github.run_id }}

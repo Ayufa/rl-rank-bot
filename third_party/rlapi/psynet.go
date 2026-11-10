@@ -1,0 +1,201 @@
+package rlapi
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gorilla/websocket"
+)
+
+const (
+	baseURL      = "https://api.rlpp.psynet.gg/rpc"
+	gameVersion  = "261031.63733.533021"
+	featureSet   = "PrimeUpdate60_FFE7A62B41040BB67F8829FD67F2EE8A"
+	buildSecret  = "eba094a6fd9abbdf913dcbadf18ab59682671cdcc7cebc4902b81113273f5fa3"
+	psySigKey    = "c338bd36fb8c42b1a431d30add939fc7"
+	pingInterval = 20 * time.Second
+	pongTimeout  = 10 * time.Second
+)
+
+type psyNetError struct {
+	Type    string `json:"Type"`
+	Message string `json:"Message"`
+}
+
+func (e psyNetError) Error() string {
+	return fmt.Sprintf("%s: %s", e.Type, e.Message)
+}
+
+// PsyNet represents the HTTP API client, see PsyNetRPC for the WebSocket client.
+type PsyNet struct {
+	client      *http.Client
+	requestID   *requestIDCounter
+	logger      *slog.Logger
+	gameVersion string
+	featureSet  string
+	buildID     string
+	buildSecret string
+}
+
+type PsyRequest struct {
+	Service   string      `json:"PsyService"`
+	Sig       string      `json:"PsySig"`
+	RequestID string      `json:"PsyRequestID"`
+	Data      interface{} `json:"-"`
+}
+
+type PsyResponse struct {
+	ResponseID string          `json:"PsyResponseID"`
+	Result     json.RawMessage `json:"Result"`
+	Error      *psyNetError    `json:"Error"`
+}
+
+func generatePsySig(body []byte) string {
+	h := hmac.New(sha256.New, []byte(psySigKey))
+	h.Write([]byte("-"))
+	h.Write(body)
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func NewPsyNet() *PsyNet {
+	return &PsyNet{
+		client:      &http.Client{},
+		requestID:   &requestIDCounter{},
+		logger:      slog.Default(),
+		gameVersion: gameVersion,
+		featureSet:  featureSet,
+		buildID:     strconv.Itoa(int(decodeBuildID(gameVersion))),
+		buildSecret: buildSecret,
+	}
+}
+
+// Deprecated: Use NewPsyNet and SetLogger instead.
+func NewPsyNetWithLogger(logger *slog.Logger) *PsyNet {
+	return &PsyNet{
+		client:      &http.Client{},
+		requestID:   &requestIDCounter{},
+		logger:      logger,
+		gameVersion: gameVersion,
+		featureSet:  featureSet,
+		buildID:     strconv.Itoa(int(decodeBuildID(gameVersion))),
+		buildSecret: buildSecret,
+	}
+}
+
+func (p *PsyNet) SetLogger(logger *slog.Logger) {
+	p.logger = logger
+}
+
+// SetVersion overrides the default game version and feature set.
+func (p *PsyNet) SetVersion(gameVersion, featureSet string) {
+	p.gameVersion = gameVersion
+	p.featureSet = featureSet
+	p.buildID = strconv.Itoa(int(decodeBuildID(gameVersion)))
+}
+
+// GetVersion returns the current game version and feature set.
+func (p *PsyNet) GetVersion() (gameVersion, featureSet string) {
+	return p.gameVersion, p.featureSet
+}
+
+// SetBuildSecret overrides the default PsyBuildSecret sent with HTTP requests.
+func (p *PsyNet) SetBuildSecret(buildSecret string) {
+	p.buildSecret = buildSecret
+}
+
+// GetBuildSecret returns the current build secret.
+func (p *PsyNet) GetBuildSecret() string {
+	return p.buildSecret
+}
+
+func (p *PsyNet) establishSocket(url string, playerID PlayerID, psyToken string, sessionID string) (*PsyNetRPC, error) {
+	p.logger.Debug("establishing websocket connection", slog.String("url", url))
+
+	// Local patch (rl-shop-bot): a zero-value Dialer never uses a proxy,
+	// which breaks WebSocket TLS in proxied/sandboxed environments
+	// ("tls: first record does not look like a TLS handshake").
+	// ProxyFromEnvironment matches the HTTP client's behaviour and is a
+	// no-op when no proxy env vars are set (e.g. GitHub Actions).
+	dialer := websocket.Dialer{Proxy: http.ProxyFromEnvironment}
+	conn, _, err := dialer.Dial(url, http.Header{
+		"PsyBuildID":     []string{p.buildID},
+		"User-Agent":     []string{fmt.Sprintf("RL Win/%s gzip", p.gameVersion)},
+		"PsyEnvironment": []string{"Prod"},
+		"PsyToken":       []string{psyToken},
+		"PsySessionID":   []string{sessionID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial websocket: %w", err)
+	}
+
+	return newPsyNetRPC(conn, playerID, p.requestID, p.logger), nil
+}
+
+func (p *PsyNet) postJSON(path []string, params interface{}, result interface{}) error {
+	url := fmt.Sprintf("%s/%s", baseURL, strings.Join(path, "/"))
+
+	body, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("failed to marshal params: %w", err)
+	}
+
+	p.logger.Debug("sending http request", slog.String("url", url), slog.String("body", string(body)))
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", fmt.Sprintf("RL Win/%s gzip (x86_64-pc-win32) curl-7.67.0 Schannel", p.gameVersion))
+	req.Header.Set("PsyBuildID", p.buildID)
+	req.Header.Set("PsyEnvironment", "Prod")
+	req.Header.Set("PsyRequestID", p.requestID.getID())
+	req.Header.Set("PsySig", generatePsySig(body))
+	req.Header.Set("PsyBuildSecret", p.buildSecret)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	p.logger.Debug("received http response", slog.String("status", resp.Status), slog.String("body", string(respBytes)))
+
+	var wrapper struct {
+		Result json.RawMessage `json:"Result"`
+		Error  *psyNetError    `json:"Error"`
+	}
+	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
+		return fmt.Errorf("failed to unmarshal wrapper: %w", err)
+	}
+
+	if wrapper.Error != nil {
+		return wrapper.Error
+	}
+
+	if err := json.Unmarshal(wrapper.Result, result); err != nil {
+		return fmt.Errorf("failed to unmarshal result: %w", err)
+	}
+
+	return nil
+}
