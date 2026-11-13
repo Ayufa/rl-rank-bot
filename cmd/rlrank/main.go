@@ -367,20 +367,39 @@ func connect() (*rlapi.TokenResponse, *rlapi.PsyNetRPC, error) {
 			return nil, nil, fmt.Errorf("persist rotated token: %w", err)
 		}
 	}
-	code, err := egs.GetExchangeCode(auth.AccessToken)
-	if err != nil {
-		return nil, nil, fmt.Errorf("GetExchangeCode: %w", err)
+	// The EOS exchange + PsyNet AuthPlayer occasionally fail
+	// with a transient ThirdPartyError (a few percent of runs,
+	// Epic-side); those steps are idempotent, so retry them
+	// with backoff instead of failing the whole run (and
+	// triggering a GitHub failure notification). The EGS
+	// refresh above is NOT retried: its token rotates, and a
+	// response lost mid-rotation would break the chain.
+	backoff := []time.Duration{0, 5 * time.Second, 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < len(backoff); attempt++ {
+		if backoff[attempt] > 0 {
+			fmt.Printf("connect: attempt %d (last error: %v)\n", attempt+1, lastErr)
+			time.Sleep(backoff[attempt])
+		}
+		code, err := egs.GetExchangeCode(auth.AccessToken)
+		if err != nil {
+			lastErr = fmt.Errorf("GetExchangeCode: %w", err)
+			continue
+		}
+		eos, err := egs.ExchangeEOSToken(code)
+		if err != nil {
+			lastErr = fmt.Errorf("ExchangeEOSToken: %w", err)
+			continue
+		}
+		psy := rlapi.NewPsyNet()
+		rpc, err := psy.AuthPlayer(eos.AccessToken, eos.AccountID, auth.DisplayName)
+		if err != nil {
+			lastErr = fmt.Errorf("AuthPlayer: %w", err)
+			continue
+		}
+		return auth, rpc, nil
 	}
-	eos, err := egs.ExchangeEOSToken(code)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ExchangeEOSToken: %w", err)
-	}
-	psy := rlapi.NewPsyNet()
-	rpc, err := psy.AuthPlayer(eos.AccessToken, eos.AccountID, auth.DisplayName)
-	if err != nil {
-		return nil, nil, fmt.Errorf("AuthPlayer: %w", err)
-	}
-	return auth, rpc, nil
+	return nil, nil, lastErr
 }
 
 // -------------------------------------------------------------- discord
